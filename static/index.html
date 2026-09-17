@@ -51,10 +51,39 @@ function render(media){
 }
 async function download(index,formatId,btn){
   if(!currentUrl||!formatId)return;
-  btn.disabled=true;showStatus('<span class="spinner"></span>Preparing the selected source…');
+  btn.disabled=true;
+  showStatus('<span class="spinner"></span>Preparing the selected source…');
   const href=`/api/download?url=${encodeURIComponent(currentUrl)}&index=${encodeURIComponent(index)}&format_id=${encodeURIComponent(formatId)}`;
-  const a=document.createElement('a');a.href=href;a.download='';a.rel='noopener';a.style.display='none';document.body.appendChild(a);a.click();a.remove();
-  setTimeout(()=>{showStatus('Download started. This tab stays open.');setTimeout(hideStatus,3000);btn.disabled=false},800);
+  try{
+    const response=await fetch(href);
+    const type=(response.headers.get('content-type')||'').toLowerCase();
+    if(!response.ok || type.includes('text/html') || type.includes('text/plain') || type.includes('application/json')){
+      let message='Download failed.';
+      try{const data=await response.json();message=data.error||message}catch{try{message=await response.text()||message}catch{}}
+      throw new Error(message);
+    }
+    const blob=await response.blob();
+    if(!blob.size) throw new Error('The server returned an empty file.');
+    const disposition=response.headers.get('content-disposition')||'';
+    const match=disposition.match(/filename="([^"]+)"/i);
+    const filename=match?.[1]||'instagram-media.mp4';
+    const objectUrl=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=objectUrl;
+    a.download=filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(objectUrl),60000);
+    hideStatus();
+    showStatus('Download ready.');
+    setTimeout(hideStatus,2200);
+  }catch(e){
+    hideStatus();
+    showError(e.message||'Download failed.');
+  }finally{
+    btn.disabled=false;
+  }
 }
 analyze.onclick=async()=>{clearError();summary.style.display='none';const value=url.value.trim();if(!value){showError('Paste an Instagram URL first.');return}showStatus('<span class="spinner"></span>Inspecting every accessible media representation…');analyze.disabled=true;currentUrl=value;try{const r=await fetch('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:value})});const data=await r.json();if(!r.ok)throw new Error(data.error||'Could not resolve this URL.');if(!data.media?.length)throw new Error('No accessible media was found.');$('#summaryTitle').textContent=data.title||'Media found';$('#count').textContent=`${data.media_count} item${data.media_count===1?'':'s'} · ${data.total_variants||0} source variants detected`;render(data.media);summary.style.display='block';hideStatus()}catch(e){hideStatus();showError(e.message)}finally{analyze.disabled=false}};
 url.addEventListener('keydown',e=>{if(e.key==='Enter')analyze.click()});
