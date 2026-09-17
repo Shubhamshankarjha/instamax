@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import json
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from pathlib import Path
@@ -63,43 +64,85 @@ def extractor_opts():
         'skip_download': True,
         'noplaylist': False,
         'extract_flat': False,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.instagram.com/',
+        },
     }
 
 
-def get_ffmpeg_path():
-    if imageio_ffmpeg is not None:
-        try:
-            path = imageio_ffmpeg.get_ffmpeg_exe()
-            if path and os.path.exists(path):
-                return path
-        except Exception:
-            pass
-    return shutil.which('ffmpeg')
+def instagram_embed_candidates(url: str):
+    """Return alternate public embed URLs for the same Instagram media."""
+    p = urlparse(url)
+    path = p.path.rstrip('/')
+    parts = [x for x in path.split('/') if x]
+    if len(parts) < 2:
+        return []
+    kind, shortcode = parts[-2], parts[-1]
+    if kind not in {'reel', 'p', 'tv'} or not shortcode:
+        return []
+    # Instagram's public embed endpoints can expose media when the normal page
+    # extractor receives an empty media response. No account cookies are used.
+    base = f'https://www.instagram.com/{kind}/{shortcode}/embed/'
+    legacy = f'https://www.instagram.com/{kind}/{shortcode}/embed/captioned/'
+    return [base, legacy]
 
 
-def safe_name(name):
-    name = re.sub(r'[^A-Za-z0-9._ -]+', '', name or 'instagram-media').strip(' .')
-    return (name[:90] or 'instagram-media')
+def is_empty_media_error(exc):
+    text = str(exc).lower()
+    markers = (
+        'empty media response',
+        'unable to extract',
+        'no media',
+        'login required',
+        'not found',
+    )
+    return any(m in text for m in markers)
 
 
-def cache_key(url):
-    return url.split('#', 1)[0].strip()
+def extract_info_once(url):
+    with yt_dlp.YoutubeDL(extractor_opts()) as ydl:
+        return ydl.extract_info(url, download=False)
 
 
 def extract_info(url):
+    """Resolve an Instagram URL, retrying public embed variants on known failures."""
     key = cache_key(url)
     now = time.time()
     hit = RESOLVE_CACHE.get(key)
     if hit and now - hit['created'] < CACHE_TTL:
         return hit['info']
-    with yt_dlp.YoutubeDL(extractor_opts()) as ydl:
-        info = ydl.extract_info(url, download=False)
-    RESOLVE_CACHE[key] = {'created': now, 'info': info}
-    if len(RESOLVE_CACHE) > 20:
-        oldest = min(RESOLVE_CACHE, key=lambda k: RESOLVE_CACHE[k]['created'])
-        RESOLVE_CACHE.pop(oldest, None)
-    return info
 
+    errors = []
+    candidates = [url]
+    candidates.extend(instagram_embed_candidates(url))
+
+    for attempt, candidate in enumerate(candidates):
+        try:
+            info = extract_info_once(candidate)
+            # A successful HTTP response can still contain no useful media.
+            entries = entries_from(info)
+            if not entries:
+                raise RuntimeError('Instagram returned no accessible media.')
+            if not any((e.get('formats') or e.get('url')) for e in entries):
+                raise RuntimeError('Instagram returned an empty media response.')
+            RESOLVE_CACHE[key] = {'created': time.time(), 'info': info}
+            if len(RESOLVE_CACHE) > 20:
+                oldest = min(RESOLVE_CACHE, key=lambda k: RESOLVE_CACHE[k]['created'])
+                RESOLVE_CACHE.pop(oldest, None)
+            return info
+        except Exception as exc:
+            errors.append(str(exc))
+            if attempt == 0 and not is_empty_media_error(exc):
+                break
+            time.sleep(0.25)
+
+    # Keep the most useful extractor error, but present it as a single JSON error
+    # to the frontend rather than allowing an HTML/traceback response to leak out.
+    if errors:
+        raise RuntimeError(errors[-1][:1400])
+    raise RuntimeError('Instagram media could not be resolved.')
 
 def entries_from(info):
     raw = info.get('entries')
@@ -303,7 +346,11 @@ def resolve():
             'note': 'Every distinct video representation exposed by the extractor is shown. Selecting a source downloads that exact video representation and, when needed, muxes the best accessible audio without re-encoding the video.',
         })
     except Exception as exc:
-        return jsonify({'error': str(exc)[:1000]}), 502
+        message = str(exc)[:1400]
+        if 'empty media response' in message.lower():
+            message = ('Instagram did not expose media to the anonymous extractor for this URL. '
+                       'The same public post may still work later or through a different Instagram representation.')
+        return jsonify({'error': message}), 502
 
 
 def header_blob(headers):
@@ -476,7 +523,11 @@ def download():
                 os.rmdir(temp_dir)
             except OSError:
                 pass
-        return jsonify({'error': 'Download failed: ' + str(exc)[:900]}), 502
+        message = str(exc)[:1200]
+        if 'empty media response' in message.lower():
+            message = ('Instagram did not expose this media to the anonymous extractor. '
+                       'Try analyzing again or use another publicly accessible post.')
+        return jsonify({'error': 'Download failed: ' + message}), 502
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '8787'))
