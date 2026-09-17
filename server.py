@@ -18,6 +18,7 @@ except ImportError:
     imageio_ffmpeg = None
 
 app = Flask(__name__, static_folder='static', static_url_path='')
+SITE_URL = os.environ.get('SITE_URL', 'https://instamax-whbk.onrender.com').rstrip('/')
 ALLOWED_HOSTS = {'instagram.com', 'www.instagram.com', 'm.instagram.com'}
 RESOLVE_CACHE = {}
 CACHE_TTL = 180
@@ -349,6 +350,35 @@ def media_row(idx, item, fallback_title):
 def index():
     return app.send_static_file('index.html')
 
+
+PAGE_MAP = {
+    '/instagram-video-downloader': 'instagram-video-downloader.html',
+    '/instagram-reel-downloader': 'instagram-reel-downloader.html',
+    '/instagram-photo-downloader': 'instagram-photo-downloader.html',
+    '/instagram-story-downloader': 'instagram-story-downloader.html',
+    '/instagram-carousel-downloader': 'instagram-carousel-downloader.html',
+    '/about': 'about.html',
+    '/privacy': 'privacy.html',
+    '/terms': 'terms.html',
+    '/copyright': 'copyright.html',
+    '/contact': 'contact.html',
+}
+
+for _path, _filename in PAGE_MAP.items():
+    app.add_url_rule(_path, endpoint='page_' + _filename.replace('.', '_'), view_func=lambda _filename=_filename: app.send_static_file(_filename))
+
+@app.get('/robots.txt')
+def robots():
+    return Response(f'User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: {SITE_URL}/sitemap.xml\n', mimetype='text/plain')
+
+@app.get('/sitemap.xml')
+def sitemap():
+    pages = ['/', *PAGE_MAP.keys()]
+    urls = []
+    for p in pages:
+        urls.append(f'<url><loc>{SITE_URL}{p}</loc></url>')
+    xml = '<?xml version="1.0" encoding="UTF-8"?>' + '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + ''.join(urls) + '</urlset>'
+    return Response(xml, mimetype='application/xml')
 
 @app.get('/api/health')
 def health():
