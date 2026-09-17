@@ -23,6 +23,22 @@ RESOLVE_CACHE = {}
 CACHE_TTL = 180
 
 
+def cache_key(url: str) -> str:
+    """Build a stable cache key for an Instagram URL.
+
+    Tracking query parameters such as utm_source/stkn do not change the
+    underlying Instagram media, so strip the query/fragment to avoid duplicate
+    extraction work while keeping the path that identifies the post/reel.
+    """
+    try:
+        p = urlparse(url.strip())
+        host = (p.hostname or '').lower()
+        path = p.path.rstrip('/')
+        return f'{p.scheme.lower()}://{host}{path}'
+    except Exception:
+        return url.strip()
+
+
 def valid_instagram_url(url: str) -> bool:
     try:
         p = urlparse(url.strip())
