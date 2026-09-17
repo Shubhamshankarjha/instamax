@@ -1,20 +1,20 @@
-InstaMax v5 - full source-variant inspector
+InstaMax
 
-What changed:
-- Shows every distinct accessible video representation exposed by yt-dlp.
-- Keeps multiple bitrate variants at the same resolution instead of collapsing them to 2160/1440/1080/720/480/360 tiers.
-- Displays exact dimensions, IDM-style resolution label, bitrate, estimated size, FPS, codec, extension, and whether audio is already included.
-- Lets the user select an exact format_id.
-- Downloads that selected source variant. If it is video-only, InstaMax muxes the best accessible audio with ffmpeg using stream copy, without re-encoding the video.
-- Keeps the download in the same tab flow.
+Quality-aware Instagram media downloader prototype.
 
-Run on Windows:
-1. Extract this folder.
-2. Double-click start.bat.
-3. Open http://127.0.0.1:8787 if it does not open automatically.
-4. Paste a real public Instagram URL and Analyze URL.
+Run locally:
+1. Install Python 3.
+2. Run: pip install -r requirements.txt
+3. Start: python server.py
+4. Open http://127.0.0.1:8787
 
-Requirements:
-- Python 3.10+
-- Internet access
-- requirements.txt installs Flask, yt-dlp and imageio-ffmpeg.
+Production notes:
+- Render supplies PORT; set HOST=0.0.0.0.
+- Do not commit secrets, cookies, or .env files.
+- Review Privacy, Terms and Copyright pages before commercial launch.
+- Update the site URL in server.py and the HTML metadata when moving from the Render URL to a custom domain.
+
+SEO assets included:
+- /robots.txt
+- /sitemap.xml
+- Dedicated landing pages for video, reels, photos, stories and carousels
