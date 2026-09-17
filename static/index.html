@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>InstaMax • Choose the exact available quality</title>
+<style>
+:root{--bg:#07080c;--panel:#0f1117;--panel2:#131720;--line:#262a36;--text:#f8f9fc;--muted:#9da5b7;--accent:#ff4f9a;--accent2:#7c5cff;--good:#67e29a;--warn:#ffd27c;--danger:#ff7676}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 600px at 50% -140px,#27142f,transparent 68%),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;min-height:100vh}
+.wrap{width:min(1180px,94vw);margin:auto;padding:58px 0 72px}.eyebrow{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:#c6b0ff;font-weight:800}.brand{font-size:clamp(42px,7vw,76px);font-weight:950;letter-spacing:-.06em;line-height:.98;margin-top:8px}.brand::after{content:"";display:inline-block;width:13px;height:13px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));vertical-align:12px;margin-left:6px}.sub{max-width:870px;color:#aeb6c7;font-size:16px;line-height:1.65;margin:20px 0 26px}.box{display:flex;gap:10px;background:rgba(16,18,24,.8);border:1px solid #282c38;border-radius:20px;padding:10px;box-shadow:0 12px 45px rgba(0,0,0,.25)}input{flex:1;background:#090b0f;color:#fff;border:0;outline:0;padding:0 17px;height:54px;font-size:15px;border-radius:13px;min-width:0}button{border:0;color:#fff;background:linear-gradient(90deg,var(--accent),var(--accent2));font-weight:900;border-radius:13px;cursor:pointer}button:disabled{opacity:.55;cursor:not-allowed}.box button{padding:0 22px;min-width:154px}.hint{margin-top:9px;color:#6f7788;font-size:12px}.status,.error{margin-top:16px;border-radius:14px;padding:12px 14px;font-size:13px}.status{display:none;background:#12151c;border:1px solid #272d39;color:#cbd2df}.error{display:none;background:#221113;border:1px solid #4d252c;color:#ffb1b1}.summary{display:none;margin-top:26px}.summary-head{display:flex;justify-content:space-between;gap:20px;align-items:end}.summary-title{font-size:22px;font-weight:900}.summary-note{max-width:580px;color:#7d8798;font-size:12px;line-height:1.5;text-align:right}.count-line{color:#6e7789;font-size:12px;margin-top:5px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px}.card{background:rgba(15,17,23,.92);border:1px solid var(--line);border-radius:20px;overflow:hidden}.media{aspect-ratio:16/10;background:#0a0c10;position:relative;display:grid;place-items:center}.media img{width:100%;height:100%;object-fit:cover}.index{position:absolute;top:12px;left:12px;background:rgba(0,0,0,.68);border:1px solid rgba(255,255,255,.12);backdrop-filter:blur(8px);padding:6px 9px;border-radius:999px;font-size:11px;font-weight:800}.body{padding:16px}.type{font-size:10px;font-weight:900;letter-spacing:.16em;text-transform:uppercase;color:#9f8dff}.title{margin-top:5px;font-size:18px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pills{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.pill{font-size:11px;font-weight:800;color:#d8deea;background:#1a1e28;border:1px solid #2a2f3b;border-radius:999px;padding:6px 9px}.qualitybox{margin-top:15px;border:1px solid #242a36;background:#0b0e13;border-radius:15px;padding:13px}.qualitytop{display:flex;justify-content:space-between;gap:12px;align-items:center}.qualitytitle{font-weight:900}.sourcecount{font-size:11px;color:#7f899a}.qualityintro{margin-top:5px;color:#7e899a;font-size:11px;line-height:1.45}.variants{margin-top:11px;display:flex;flex-direction:column;gap:7px;max-height:390px;overflow:auto;padding-right:2px}.variant{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;border:1px solid #242a35;background:#11151d;border-radius:12px;padding:9px 10px;cursor:pointer;transition:.15s}.variant:hover{border-color:#6c5dff;background:#161827}.variant.selected{border-color:#b28dff;background:#201b2e;box-shadow:0 0 0 1px #b28dff inset}.variant input{width:17px;height:17px;padding:0;accent-color:#aa76ff}.vmain{min-width:0}.vheadline{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.vres{font-weight:900;font-size:12px}.vbadge{font-size:9px;padding:3px 5px;border-radius:999px;background:#1d3728;color:var(--good);font-weight:800}.vmeta{margin-top:3px;color:#7f899a;font-size:10px;line-height:1.35}.vright{text-align:right}.vbr{font-size:12px;font-weight:900}.vsize{font-size:10px;color:#788294;margin-top:3px}.actions{margin-top:13px;display:flex;gap:8px}.download{padding:12px 15px;flex:1}.copy{padding:12px 14px;background:#191c24}.foot{margin-top:28px;color:#6f7788;font-size:12px;line-height:1.65}.spinner{display:inline-block;width:13px;height:13px;border:2px solid #555d6d;border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px;margin-right:7px}@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:840px){.grid{grid-template-columns:1fr}.summary-head{display:block}.summary-note{text-align:left;margin-top:6px}}@media(max-width:680px){.wrap{padding-top:38px}.box{flex-direction:column}.box button{height:54px}.grid{grid-template-columns:1fr}.variant{grid-template-columns:auto 1fr}.vright{grid-column:2;text-align:left}}
+</style>
+</head>
+<body><div class="wrap">
+<div class="eyebrow">InstaMax</div>
+<div class="brand">Keep the quality.</div>
+<div class="sub">Paste a real Instagram URL. InstaMax exposes the media representations the extractor can actually see, including multiple bitrates at the same resolution, so you choose the exact source instead of getting one mystery “HD” file.</div>
+<div class="box"><input id="url" placeholder="https://www.instagram.com/reel/..." autocomplete="off"><button id="analyze">Analyze URL</button></div>
+<div class="hint">Publicly accessible URLs only. Private or login-gated media may fail.</div>
+<div id="status" class="status"></div><div id="error" class="error"></div>
+<div id="summary" class="summary">
+  <div class="summary-head"><div><div class="summary-title" id="summaryTitle">Media found</div><div class="count-line" id="count"></div></div><div class="summary-note">Every distinct accessible video representation is listed. Higher resolution is not enough by itself, so bitrate and frame rate are shown too.</div></div>
+  <div id="grid" class="grid"></div>
+</div>
+<div class="foot">InstaMax does not bypass private-account access controls. Instagram may limit or alter which media representations are publicly accessible. A selected source is downloaded as exposed, without intentionally upscaling or re-encoding the video.</div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const url=$('#url'),analyze=$('#analyze'),statusEl=$('#status'),errorEl=$('#error'),summary=$('#summary'),grid=$('#grid');let currentUrl='';
+function showStatus(t){statusEl.style.display='block';statusEl.innerHTML=t}function hideStatus(){statusEl.style.display='none'}function showError(t){errorEl.style.display='block';errorEl.textContent=t}function clearError(){errorEl.style.display='none';errorEl.textContent=''}
+function esc(v){return String(v??'').replace(/[&<>'"]/g,s=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[s]))}
+function fmtSize(b){if(!b)return 'Size unknown';const u=['B','KB','MB','GB'];let x=b,i=0;while(x>=1024&&i<3){x/=1024;i++}return `${x<10&&i?x.toFixed(1):Math.round(x)} ${u[i]}`}
+function selectedFromCard(card){return card.querySelector('.variant.selected')}
+function variantHtml(v,i){const selected=i===0;return `<label class="variant ${selected?'selected':''}" data-format-id="${esc(v.format_id)}"><input type="radio" name="quality-${esc(String(v.media_index))}" ${selected?'checked':''}><div class="vmain"><div class="vheadline"><span class="vres">${esc(v.resolution||v.label)}</span><span class="vbadge">Available</span></div><div class="vmeta">${esc(v.label)}${v.fps?` · ${Math.round(v.fps)} fps`:''}${v.vcodec?` · ${esc(v.vcodec)}`:''}${v.has_audio?' · audio included':' · video stream + best audio on download'}${v.ext?` · ${esc(v.ext)}`:''}</div></div><div class="vright"><div class="vbr">${esc(v.bitrate_label||'Bitrate n/a')}</div><div class="vsize">${esc(v.filesize_label||'Size unknown')}</div></div></label>`}
+function render(media){
+  grid.innerHTML='';
+  media.forEach(m=>{
+    const card=document.createElement('article');card.className='card';
+    const thumb=m.thumbnail?`<img src="${esc(m.thumbnail)}" alt="">`:`<div style="width:100%;height:100%;display:grid;place-items:center;color:#697285">No preview</div>`;
+    const variants=(m.variants||[]).map(v=>({...v,media_index:m.index}));
+    card.innerHTML=`<div class="media">${thumb}<div class="index">#${m.index}</div></div><div class="body"><div class="type">${esc(m.type)}</div><div class="title" title="${esc(m.title)}">${esc(m.title)}</div><div class="pills"><span class="pill">${m.width&&m.height?esc(`${m.width} × ${m.height}`):'Dimensions n/a'}</span><span class="pill">${m.fps?esc(String(Math.round(m.fps)))+' fps':'Frame rate n/a'}</span><span class="pill">${esc(m.ext||'media')}</span><span class="pill">${esc(String(m.variant_count||0))} source variants</span></div><div class="qualitybox"><div class="qualitytop"><div class="qualitytitle">Choose source quality</div><div class="sourcecount">${esc(String(m.variant_count||0))} available</div></div><div class="qualityintro">IDM-style list: same resolution can appear multiple times because Instagram may expose different bitrate representations. Pick the exact one you want.</div><div class="variants">${variants.map((v,i)=>variantHtml(v,i)).join('')}</div></div><div class="actions"><button class="download" data-index="${m.index}">${variants[0]?'Download '+esc(variants[0].label):'Download'}</button><button class="copy" data-index="${m.index}">Copy link</button></div></div>`;
+    grid.appendChild(card);
+    card.querySelectorAll('.variant').forEach(v=>v.addEventListener('click',()=>{
+      card.querySelectorAll('.variant').forEach(x=>x.classList.remove('selected'));v.classList.add('selected');v.querySelector('input').checked=true;
+      const d=card.querySelector('.download');const obj=variants.find(x=>String(x.format_id)===String(v.dataset.formatId));d.textContent=`Download ${obj?.label||'selected source'}`;d.dataset.formatId=v.dataset.formatId;
+    }));
+    const first=card.querySelector('.variant.selected');const downloadBtn=card.querySelector('.download');downloadBtn.dataset.formatId=first?.dataset.formatId||'';
+    downloadBtn.onclick=()=>download(m.index,downloadBtn.dataset.formatId,downloadBtn);
+    card.querySelector('.copy').onclick=async()=>{try{await navigator.clipboard.writeText(currentUrl);showStatus('Instagram URL copied.');setTimeout(hideStatus,1500)}catch{showStatus('Copy is unavailable in this browser.')}};
+  });
+}
+async function download(index,formatId,btn){
+  if(!currentUrl||!formatId)return;
+  btn.disabled=true;showStatus('<span class="spinner"></span>Preparing the selected source…');
+  const href=`/api/download?url=${encodeURIComponent(currentUrl)}&index=${encodeURIComponent(index)}&format_id=${encodeURIComponent(formatId)}`;
+  const a=document.createElement('a');a.href=href;a.download='';a.rel='noopener';a.style.display='none';document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>{showStatus('Download started. This tab stays open.');setTimeout(hideStatus,3000);btn.disabled=false},800);
+}
+analyze.onclick=async()=>{clearError();summary.style.display='none';const value=url.value.trim();if(!value){showError('Paste an Instagram URL first.');return}showStatus('<span class="spinner"></span>Inspecting every accessible media representation…');analyze.disabled=true;currentUrl=value;try{const r=await fetch('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:value})});const data=await r.json();if(!r.ok)throw new Error(data.error||'Could not resolve this URL.');if(!data.media?.length)throw new Error('No accessible media was found.');$('#summaryTitle').textContent=data.title||'Media found';$('#count').textContent=`${data.media_count} item${data.media_count===1?'':'s'} · ${data.total_variants||0} source variants detected`;render(data.media);summary.style.display='block';hideStatus()}catch(e){hideStatus();showError(e.message)}finally{analyze.disabled=false}};
+url.addEventListener('keydown',e=>{if(e.key==='Enter')analyze.click()});
+</script>
+</body></html>
