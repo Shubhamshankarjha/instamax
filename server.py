@@ -1,12 +1,14 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file
 import mimetypes
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from pathlib import Path
 
 import yt_dlp
 try:
@@ -348,18 +350,24 @@ def download():
         media_index = max(1, int(request.args.get('index', '1')))
     except ValueError:
         media_index = 1
+
     format_id = request.args.get('format_id', '').strip() or None
+
     if not valid_instagram_url(url):
-        return Response('Invalid Instagram URL', status=400)
+        return jsonify({'error': 'Invalid Instagram URL.'}), 400
+
+    temp_dir = None
     try:
+        # Re-resolve immediately before download so CDN URLs and their headers are fresh.
         info = extract_info(url)
         item, chosen, best_audio = selected_media(info, media_index, format_id)
+
         if not chosen or not chosen.get('url'):
-            return Response('The selected source variant is no longer available. Analyze the URL again and retry.', status=502)
+            return jsonify({'error': 'The selected source variant is no longer available. Analyze the URL again and retry.'}), 502
 
         title = safe_name(item.get('title') or info.get('title') or f'instagram-media-{media_index}')
 
-        # Progressive media or image can be streamed directly without touching/re-encoding it.
+        # If the selected representation already contains audio, stream that exact URL.
         if chosen.get('acodec') not in (None, 'none') or chosen.get('vcodec') in (None, 'none'):
             ext = (chosen.get('ext') or ('jpg' if chosen.get('vcodec') in (None, 'none') else 'mp4')).lower()
             filename = title + '.' + ext
@@ -373,62 +381,102 @@ def download():
                 headers['Content-Length'] = str(chosen['filesize'])
             return Response(http_stream(chosen['url'], chosen.get('http_headers')), headers=headers, direct_passthrough=True)
 
-        # Video-only source: merge with best accessible audio while copying both streams.
-        ffmpeg = get_ffmpeg_path()
-        if chosen.get('vcodec') not in (None, 'none') and best_audio and best_audio.get('url'):
+        # Video-only formats are downloaded with yt-dlp itself. This is more reliable
+        # than handing Instagram CDN URLs directly to ffmpeg because yt-dlp preserves
+        # the extractor's per-format HTTP headers and CDN access parameters.
+        if chosen.get('vcodec') not in (None, 'none'):
+            ffmpeg = get_ffmpeg_path()
             if not ffmpeg:
-                return Response('ffmpeg is required to combine the selected video with audio. Run start.bat again.', status=502)
-            args = [ffmpeg, '-hide_banner', '-loglevel', 'error']
-            vh = header_blob(chosen.get('http_headers'))
-            ah = header_blob(best_audio.get('http_headers'))
-            if vh:
-                args += ['-headers', vh]
-            args += ['-i', chosen['url']]
-            if ah:
-                args += ['-headers', ah]
-            args += [
-                '-i', best_audio['url'],
-                '-map', '0:v:0', '-map', '1:a:0?',
-                '-c:v', 'copy', '-c:a', 'copy',
-                '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-                '-f', 'mp4', 'pipe:1'
-            ]
-            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                return jsonify({'error': 'ffmpeg is not available on the server.'}), 502
 
-            def generate():
-                stderr_data = b''
-                try:
-                    while True:
-                        chunk = proc.stdout.read(256 * 1024)
-                        if not chunk:
-                            break
-                        yield chunk
-                    rc = proc.wait(timeout=20)
-                    stderr_data = proc.stderr.read(2000) if proc.stderr else b''
-                    if rc != 0:
-                        err = stderr_data.decode('utf-8', 'ignore')[:700]
-                        raise RuntimeError(err or 'ffmpeg failed')
-                finally:
-                    try:
-                        proc.stdout.close()
-                    except Exception:
-                        pass
-                    try:
-                        proc.stderr.close()
-                    except Exception:
-                        pass
+            temp_dir = tempfile.mkdtemp(prefix='instamax-')
+            outtmpl = os.path.join(temp_dir, 'media.%(ext)s')
 
-            headers = {
-                'Content-Disposition': cd(title + '.mp4'),
-                'Content-Type': 'video/mp4',
-                'Cache-Control': 'no-store',
+            # First attempt: exact selected video representation + best accessible audio.
+            # yt-dlp/ffmpeg will remux without re-encoding when the streams are compatible.
+            format_expr = f'{format_id}+bestaudio' if format_id else 'bestvideo+bestaudio/best'
+            opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'format': format_expr,
+                'outtmpl': outtmpl,
+                'merge_output_format': 'mp4',
+                'ffmpeg_location': ffmpeg,
+                'overwrites': True,
             }
-            return Response(generate(), headers=headers, direct_passthrough=True)
 
-        return Response('The selected source variant cannot be downloaded from the exposed formats.', status=502)
+            downloaded_path = None
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+                files = [
+                    os.path.join(temp_dir, name)
+                    for name in os.listdir(temp_dir)
+                    if os.path.isfile(os.path.join(temp_dir, name))
+                    and not name.endswith(('.part', '.ytdl'))
+                ]
+                if files:
+                    downloaded_path = max(files, key=os.path.getsize)
+            except Exception:
+                # If combining audio fails, fall back to the exact selected video stream.
+                opts['format'] = str(format_id) if format_id else 'bestvideo'
+                opts.pop('merge_output_format', None)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+                files = [
+                    os.path.join(temp_dir, name)
+                    for name in os.listdir(temp_dir)
+                    if os.path.isfile(os.path.join(temp_dir, name))
+                    and not name.endswith(('.part', '.ytdl'))
+                ]
+                if files:
+                    downloaded_path = max(files, key=os.path.getsize)
+
+            if not downloaded_path:
+                raise RuntimeError('The selected media could not be downloaded from Instagram.')
+
+            ext = Path(downloaded_path).suffix.lower() or '.mp4'
+            filename = title + ('.mp4' if ext in ('.mp4', '.m4v', '.mov') else ext)
+            mime = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+
+            response = send_file(
+                downloaded_path,
+                mimetype=mime,
+                as_attachment=True,
+                download_name=filename,
+                conditional=True,
+                max_age=0,
+            )
+
+            def cleanup():
+                try:
+                    for name in os.listdir(temp_dir):
+                        try:
+                            os.remove(os.path.join(temp_dir, name))
+                        except OSError:
+                            pass
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
+
+            response.call_on_close(cleanup)
+            return response
+
+        return jsonify({'error': 'The selected source variant cannot be downloaded from the exposed formats.'}), 502
+
     except Exception as exc:
-        return Response('Download failed: ' + str(exc)[:900], status=502)
-
+        if temp_dir:
+            try:
+                for name in os.listdir(temp_dir):
+                    try:
+                        os.remove(os.path.join(temp_dir, name))
+                    except OSError:
+                        pass
+                os.rmdir(temp_dir)
+            except OSError:
+                pass
+        return jsonify({'error': 'Download failed: ' + str(exc)[:900]}), 502
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '8787'))
