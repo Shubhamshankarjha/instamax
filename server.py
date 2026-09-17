@@ -73,6 +73,22 @@ def format_score(f):
     )
 
 
+def get_ffmpeg_path():
+    if imageio_ffmpeg is not None:
+        try:
+            path = imageio_ffmpeg.get_ffmpeg_exe()
+            if path and os.path.exists(path):
+                return path
+        except Exception:
+            pass
+    return shutil.which('ffmpeg')
+
+
+def safe_name(name):
+    name = re.sub(r'[^A-Za-z0-9._ -]+', '', name or 'instagram-media').strip(' .')
+    return (name[:90] or 'instagram-media')
+
+
 def extractor_opts():
     return {
         'quiet': True,
