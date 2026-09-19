@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import json
@@ -97,6 +98,7 @@ def extractor_opts():
         'skip_download': True,
         'noplaylist': False,
         'extract_flat': False,
+        'ignore_no_formats_error': True,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
@@ -134,6 +136,95 @@ def is_empty_media_error(exc):
     return any(m in text for m in markers)
 
 
+def gallery_dl_media_urls(url):
+    """Use gallery-dl as a public-image fallback when yt-dlp cannot expose image media."""
+    try:
+        cmd = [
+            sys.executable, '-m', 'gallery_dl',
+            '--quiet', '--no-input', '--no-colors',
+            '--get-urls', url,
+        ]
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    urls = []
+    seen = set()
+    for line in (proc.stdout or '').splitlines():
+        candidate = line.strip()
+        if not candidate.startswith(('http://', 'https://')):
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        urls.append(candidate)
+    return urls
+
+
+def gallery_dl_info(url):
+    """Build yt-dlp-like media info from gallery-dl's direct public URLs."""
+    media_urls = gallery_dl_media_urls(url)
+    if not media_urls:
+        return None
+
+    entries = []
+    video_exts = {'.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi'}
+    base_headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/139.0 Safari/537.36'
+        ),
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.instagram.com/',
+    }
+
+    for idx, media_url in enumerate(media_urls, 1):
+        ext = Path(urlparse(media_url).path).suffix.lower()
+        if not ext:
+            ext = '.jpg'
+
+        is_video = ext in video_exts
+        format_id = f'gallery-{idx}'
+        entry = {
+            'id': format_id,
+            'title': f'Instagram media {idx}',
+            'webpage_url': url,
+            '_source': 'gallery-dl',
+            'formats': [{
+                'format_id': format_id,
+                'url': media_url,
+                'ext': ext.lstrip('.'),
+                'width': None,
+                'height': None,
+                'fps': None,
+                'tbr': None,
+                'filesize': None,
+                'filesize_approx': None,
+                'vcodec': 'h264' if is_video else 'none',
+                'acodec': 'none',
+                'http_headers': base_headers,
+            }],
+        }
+        entries.append(entry)
+
+    if not entries:
+        return None
+
+    return {
+        'id': urlparse(url).path.rstrip('/').split('/')[-1] or 'instagram-media',
+        'title': 'Instagram media',
+        'webpage_url': url,
+        '_source': 'gallery-dl',
+        'entries': entries,
+    }
+
 def extract_info_once(url):
     with yt_dlp.YoutubeDL(extractor_opts()) as ydl:
         return ydl.extract_info(url, download=False)
@@ -170,6 +261,16 @@ def extract_info(url):
             if attempt == 0 and not is_empty_media_error(exc):
                 break
             time.sleep(0.25)
+
+    # Image-only posts and image-only carousels are currently not reliably
+    # represented by yt-dlp. Use gallery-dl as a public-media fallback.
+    fallback = gallery_dl_info(url)
+    if fallback:
+        RESOLVE_CACHE[key] = {'created': time.time(), 'info': fallback}
+        if len(RESOLVE_CACHE) > 20:
+            oldest = min(RESOLVE_CACHE, key=lambda k: RESOLVE_CACHE[k]['created'])
+            RESOLVE_CACHE.pop(oldest, None)
+        return fallback
 
     # Keep the most useful extractor error, but present it as a single JSON error
     # to the frontend rather than allowing an HTML/traceback response to leak out.
@@ -343,6 +444,7 @@ def media_row(idx, item, fallback_title):
         'best_audio_id': (best_audio or {}).get('format_id'),
         'best_progressive_id': (best_progressive or {}).get('format_id'),
         'variants': variants,
+        '_source': item.get('_source') or info.get('_source'),
     }
 
 
@@ -475,6 +577,26 @@ def download():
             return jsonify({'error': 'The selected source variant is no longer available. Analyze the URL again and retry.'}), 502
 
         title = safe_name(item.get('title') or info.get('title') or f'instagram-media-{media_index}')
+
+        # gallery-dl fallback entries already contain public direct media URLs.
+        # Stream them directly instead of sending the original Instagram URL
+        # back through yt-dlp/ffmpeg.
+        if item.get('_source') == 'gallery-dl' or info.get('_source') == 'gallery-dl':
+            ext = (chosen.get('ext') or 'jpg').lower().lstrip('.')
+            filename = title + '.' + ext
+            mime = mimetypes.guess_type(filename)[0] or (
+                'video/mp4' if ext in {'mp4', 'm4v', 'mov', 'webm'} else 'image/jpeg'
+            )
+            headers = {
+                'Content-Disposition': cd(filename),
+                'Content-Type': mime,
+                'Cache-Control': 'no-store',
+            }
+            return Response(
+                http_stream(chosen['url'], chosen.get('http_headers')),
+                headers=headers,
+                direct_passthrough=True,
+            )
 
         # If the selected representation already contains audio, stream that exact URL.
         if chosen.get('acodec') not in (None, 'none') or chosen.get('vcodec') in (None, 'none'):
