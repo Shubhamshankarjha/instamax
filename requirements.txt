@@ -2,3 +2,4 @@ Flask>=3.0
 yt-dlp>=2026.08.0
 imageio-ffmpeg>=0.6.0
 requests>=2.32.0
+gallery-dl
