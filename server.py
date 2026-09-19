@@ -137,34 +137,51 @@ def is_empty_media_error(exc):
 
 
 def gallery_dl_media_urls(url):
-    """Use gallery-dl as a public-image fallback when yt-dlp cannot expose image media."""
-    try:
-        cmd = [
-            sys.executable, '-m', 'gallery_dl',
-            '--quiet', '--no-input', '--no-colors',
-            '--get-urls', url,
-        ]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=45,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
+    """Use gallery-dl as a public-media fallback for Instagram images/videos.
 
-    urls = []
-    seen = set()
-    for line in (proc.stdout or '').splitlines():
-        candidate = line.strip()
-        if not candidate.startswith(('http://', 'https://')):
+    Try resolved URLs first. gallery-dl may otherwise emit helper lines such as
+    ``ytdl:dash`` and a following ``| <url>`` line for some video entries.
+    """
+    commands = [
+        [sys.executable, '-m', 'gallery_dl', '--config-ignore', '--quiet', '--no-input', '--resolve-urls', url],
+        [sys.executable, '-m', 'gallery_dl', '--config-ignore', '--quiet', '--no-input', '--get-urls', url],
+    ]
+    last_error = ''
+    for cmd in commands:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            last_error = str(exc)
             continue
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        urls.append(candidate)
-    return urls
+
+        last_error = (proc.stderr or '').strip()
+        urls = []
+        seen = set()
+        for line in (proc.stdout or '').splitlines():
+            candidate = line.strip()
+            if candidate.startswith('|'):
+                candidate = candidate[1:].strip()
+            if not candidate.startswith(('http://', 'https://')):
+                continue
+            # Keep only actual media URLs, not an Instagram page URL emitted by an extractor.
+            host = (urlparse(candidate).hostname or '').lower()
+            if 'instagram.com' in host and 'cdn' not in host:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            urls.append(candidate)
+
+        if urls:
+            return urls
+
+    return []
 
 
 def gallery_dl_info(url):
@@ -275,8 +292,9 @@ def extract_info(url):
     # Keep the most useful extractor error, but present it as a single JSON error
     # to the frontend rather than allowing an HTML/traceback response to leak out.
     if errors:
-        raise RuntimeError(errors[-1][:1400])
-    raise RuntimeError('Instagram media could not be resolved.')
+        last = errors[-1][:1400]
+        raise RuntimeError('Public Instagram media could not be resolved by the available extractors. ' + last)
+    raise RuntimeError('Public Instagram media could not be resolved by the available extractors.')
 
 def entries_from(info):
     raw = info.get('entries')
@@ -444,7 +462,7 @@ def media_row(idx, item, fallback_title):
         'best_audio_id': (best_audio or {}).get('format_id'),
         'best_progressive_id': (best_progressive or {}).get('format_id'),
         'variants': variants,
-        '_source': item.get('_source') or info.get('_source'),
+        '_source': item.get('_source'),
     }
 
 
