@@ -409,6 +409,102 @@ def _format_from_video_candidate(c, idx=1):
         'http_headers': extractor_opts()['http_headers'],
     }
 
+def _instagram_shortcode(url):
+    path_parts = [x for x in urlparse(url).path.rstrip('/').split('/') if x]
+    if len(path_parts) < 2:
+        return None
+    kind, shortcode = path_parts[-2], path_parts[-1]
+    if kind not in {'p', 'reel', 'reels', 'tv'}:
+        return None
+    return shortcode or None
+
+def _instaloader_format(url, idx, is_video=False, width=None, height=None):
+    if not url:
+        return None
+    return {
+        'format_id': f"{'vid' if is_video else 'img'}-instaloader-{idx}",
+        'url': url,
+        'width': int(width or 0) or None,
+        'height': int(height or 0) or None,
+        'fps': None,
+        'tbr': None,
+        'ext': 'mp4' if is_video else 'jpg',
+        'vcodec': 'h264' if is_video else 'none',
+        'acodec': 'aac' if is_video else 'none',
+        'filesize': None,
+        'http_headers': extractor_opts()['http_headers'],
+    }
+
+def instaloader_public_media(url):
+    """Resolve public Instagram image/video/sidecar media with Instaloader."""
+    try:
+        import instaloader
+    except ImportError as exc:
+        raise RuntimeError('Instaloader fallback is not installed.') from exc
+
+    shortcode = _instagram_shortcode(url)
+    if not shortcode:
+        raise RuntimeError('Unsupported Instagram post URL for image fallback.')
+
+    loader = instaloader.Instaloader(
+        quiet=True,
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        save_metadata=False,
+        compress_json=False,
+        download_comments=False,
+    )
+
+    post = instaloader.Post.from_shortcode(loader.context, shortcode)
+    entries = []
+    title = getattr(post, 'title', None) or 'Instagram media'
+
+    if getattr(post, 'typename', None) == 'GraphSidecar':
+        nodes = list(post.get_sidecar_nodes())
+        for idx, node in enumerate(nodes, 1):
+            is_video = bool(getattr(node, 'is_video', False))
+            video_url = getattr(node, 'video_url', None) if is_video else None
+            image_url = getattr(node, 'display_url', None)
+            media_url = video_url or image_url
+            fmt = _instaloader_format(media_url, idx, is_video=is_video)
+            if not fmt:
+                continue
+            entries.append({
+                'title': title,
+                'thumbnail': image_url,
+                'formats': [fmt],
+            })
+    elif getattr(post, 'is_video', False):
+        media_url = getattr(post, 'video_url', None)
+        fmt = _instaloader_format(media_url, 1, is_video=True)
+        if fmt:
+            entries.append({
+                'title': title,
+                'thumbnail': getattr(post, 'url', None),
+                'formats': [fmt],
+                'duration': getattr(post, 'video_duration', None),
+            })
+    else:
+        media_url = getattr(post, 'url', None)
+        fmt = _instaloader_format(media_url, 1, is_video=False)
+        if fmt:
+            entries.append({
+                'title': title,
+                'thumbnail': media_url,
+                'formats': [fmt],
+            })
+
+    if not entries:
+        raise RuntimeError('Instaloader returned no accessible media.')
+
+    return {
+        'title': title,
+        'webpage_url': url,
+        'entries': entries,
+        '_instaloader_fallback': True,
+    }
+
 def _public_page_title(html_text):
     for pattern in (
         r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
@@ -613,8 +709,19 @@ def extract_info(url):
             primary_failures.append((classification, exc, candidate))
             logger.exception('yt-dlp extraction failed for candidate %s', candidate)
 
-    # 2. Secondary Strategy: gallery-dl. Better for image/photo/carousel media.
-    # No-video and empty-media extractor failures explicitly flow through this fallback.
+    # 2. Public-media fallback for photos/carousels. Instaloader exposes
+    # sidecar nodes directly and is the primary image fallback because yt-dlp
+    # currently reports image-only carousel items as having no video formats.
+    try:
+        fallback = instaloader_public_media(url)
+        if _has_usable_media(fallback):
+            RESOLVE_CACHE[key] = {'created': time.time(), 'info': fallback}
+            return fallback
+    except Exception as exc:
+        fallback_failures.append((classify_extractor_error(exc), exc, url))
+        logger.exception('Instaloader fallback failed for %s', url)
+
+    # 3. Secondary fallback: gallery-dl.
     try:
         fallback = gallery_dl_public_media(url)
         if _has_usable_media(fallback):
@@ -624,7 +731,7 @@ def extract_info(url):
         fallback_failures.append((classify_extractor_error(exc), exc, url))
         logger.exception('gallery-dl fallback failed for %s', url)
 
-    # 3. Tertiary Strategy: HTML scraping.
+    # 4. Tertiary Strategy: HTML scraping.
     try:
         fallback = extract_public_instagram_media(url)
         if _has_usable_media(fallback):
@@ -634,9 +741,10 @@ def extract_info(url):
         fallback_failures.append((classify_extractor_error(exc), exc, url))
         logger.exception('HTML Instagram fallback failed for %s', url)
 
-    failures = primary_failures or fallback_failures
+    # Do not hide a real fallback failure behind yt-dlp's original
+    # "No video formats found" error.
+    failures = fallback_failures or primary_failures
     if failures:
-        # Prefer the original yt-dlp failure over downstream fallback errors.
         classification, cause, candidate = failures[0]
         raise ExtractionFailure(
             classification['category'],
@@ -942,6 +1050,6 @@ def download():
         return jsonify({'error': 'Download failed. The media may be private.'}), 502
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', '8787')) 
+    port = int(os.environ.get('PORT', '8787'))
     host = os.environ.get('HOST', '0.0.0.0')
     app.run(host=host, port=port, debug=False, threaded=True)
