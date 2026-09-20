@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response, send_file
+from flask import Flask, request, jsonify, Response, send_file, make_response
 import mimetypes
 import os
 import re
@@ -7,10 +7,14 @@ import subprocess
 import tempfile
 import time
 import json
+import socket
+import ipaddress
 import sys
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse, urljoin
 from pathlib import Path
+
+# Security: do not use urllib.request directly to avoid SSRF
+import requests
 
 import yt_dlp
 try:
@@ -18,20 +22,83 @@ try:
 except ImportError:
     imageio_ffmpeg = None
 
+# Protect against common DOS
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 app = Flask(__name__, static_folder='static', static_url_path='')
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
 SITE_URL = os.environ.get('SITE_URL', 'https://instamax-whbk.onrender.com').rstrip('/')
 ALLOWED_HOSTS = {'instagram.com', 'www.instagram.com', 'm.instagram.com'}
 RESOLVE_CACHE = {}
 CACHE_TTL = 180
 
+# Configure Flask to drop large requests to prevent DOS
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1 MB max request size
+
+import threading
+rate_limiter = {}
+lock = threading.Lock()
+
+def check_rate_limit(ip):
+    # Simple in-memory rate limiting (max 10 requsts per 10 seconds)
+    with lock:
+        now = time.time()
+        requests = rate_limiter.get(ip, [])
+        requests = [r for r in requests if now - r < 10]
+        if len(requests) >= 20:
+            return False
+        requests.append(now)
+        rate_limiter[ip] = requests
+        return True
+
+@app.before_request
+def before_request():
+    ip = request.remote_addr
+    if ip and not check_rate_limit(ip):
+        return jsonify({'error': 'Rate limit exceeded. Please wait.'}), 429
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    return response
+
+def is_safe_ip(ip_str):
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved)
+    except Exception:
+        return False
+
+def validate_url_safety(url):
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError(f"Disallowed scheme: {parsed.scheme}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("No hostname in URL")
+    try:
+        ip_addr = socket.gethostbyname(hostname)
+        if not is_safe_ip(ip_addr):
+            raise ValueError(f"URL resolves to disallowed IP: {ip_addr}")
+    except socket.gaierror:
+        raise ValueError("Host resolution failed")
+        
+def secure_request(url, headers=None, stream=False, timeout=30, max_redirects=5):
+    current_url = url
+    s = requests.Session()
+    for _ in range(max_redirects):
+        validate_url_safety(current_url)
+        resp = s.get(current_url, headers=headers, stream=stream, allow_redirects=False, timeout=timeout)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            current_url = urljoin(current_url, resp.headers['Location'])
+        else:
+            return resp
+    raise ValueError("Too many redirects")
 
 def cache_key(url: str) -> str:
-    """Build a stable cache key for an Instagram URL.
-
-    Tracking query parameters such as utm_source/stkn do not change the
-    underlying Instagram media, so strip the query/fragment to avoid duplicate
-    extraction work while keeping the path that identifies the post/reel.
-    """
     try:
         p = urlparse(url.strip())
         host = (p.hostname or '').lower()
@@ -40,19 +107,18 @@ def cache_key(url: str) -> str:
     except Exception:
         return url.strip()
 
-
 def valid_instagram_url(url: str) -> bool:
     try:
+        if len(url) > 500:
+            return False
         p = urlparse(url.strip())
         host = (p.hostname or '').lower()
         return p.scheme in ('http', 'https') and (host in ALLOWED_HOSTS or host.endswith('.instagram.com'))
     except Exception:
         return False
 
-
 def filesize(f):
     return f.get('filesize') or f.get('filesize_approx') or 0
-
 
 def fmt_bytes(n):
     if not n:
@@ -64,7 +130,6 @@ def fmt_bytes(n):
             return f'{x:.1f} {u}' if u != 'B' else f'{int(x)} B'
         x /= 1024
 
-
 def format_score(f):
     return (
         int(f.get('height') or 0),
@@ -73,7 +138,6 @@ def format_score(f):
         float(f.get('fps') or 0),
         int(filesize(f) or 0),
     )
-
 
 def get_ffmpeg_path():
     if imageio_ffmpeg is not None:
@@ -85,11 +149,9 @@ def get_ffmpeg_path():
             pass
     return shutil.which('ffmpeg')
 
-
 def safe_name(name):
     name = re.sub(r'[^A-Za-z0-9._ -]+', '', name or 'instagram-media').strip(' .')
     return (name[:90] or 'instagram-media')
-
 
 def extractor_opts():
     return {
@@ -105,9 +167,7 @@ def extractor_opts():
         },
     }
 
-
 def instagram_embed_candidates(url: str):
-    """Return alternate public embed URLs for the same Instagram media."""
     p = urlparse(url)
     path = p.path.rstrip('/')
     parts = [x for x in path.split('/') if x]
@@ -116,33 +176,15 @@ def instagram_embed_candidates(url: str):
     kind, shortcode = parts[-2], parts[-1]
     if kind not in {'reel', 'p', 'tv'} or not shortcode:
         return []
-    # Instagram's public embed endpoints can expose media when the normal page
-    # extractor receives an empty media response. No account cookies are used.
     base = f'https://www.instagram.com/{kind}/{shortcode}/embed/'
     legacy = f'https://www.instagram.com/{kind}/{shortcode}/embed/captioned/'
     return [base, legacy]
-
-
-def is_empty_media_error(exc):
-    text = str(exc).lower()
-    markers = (
-        'empty media response',
-        'unable to extract',
-        'no media',
-        'login required',
-        'not found',
-    )
-    return any(m in text for m in markers)
-
 
 def extract_info_once(url):
     with yt_dlp.YoutubeDL(extractor_opts()) as ydl:
         return ydl.extract_info(url, download=False)
 
-
-
 def _decode_instagram_escaped(value):
-    """Decode the JSON/HTML escaping Instagram commonly uses in page state."""
     import html
     value = html.unescape(value)
     value = value.replace('\\/', '/')
@@ -154,9 +196,7 @@ def _decode_instagram_escaped(value):
     value = re.sub(r'\\u([0-9a-fA-F]{4})', repl, value)
     return value
 
-
 def _balanced_json_fragment(text, start):
-    """Return a balanced JSON array/object beginning at start, or None."""
     if start >= len(text) or text[start] not in '[{':
         return None
     opener = text[start]
@@ -185,9 +225,7 @@ def _balanced_json_fragment(text, start):
                 return text[start:i + 1]
     return None
 
-
 def _json_values_after_key(text, key):
-    """Find all JSON arrays/objects immediately following a named key."""
     values = []
     pos = 0
     while True:
@@ -213,13 +251,11 @@ def _json_values_after_key(text, key):
         pos = pos + len(key)
     return values
 
-
 def _largest_image_candidate(candidates):
     valid = [c for c in (candidates or []) if isinstance(c, dict) and c.get('url')]
     if not valid:
         return None
     return max(valid, key=lambda c: ((c.get('height') or 0) * (c.get('width') or 0), c.get('width') or 0))
-
 
 def _format_from_image_candidate(c, idx=1):
     url = c.get('url') if isinstance(c, dict) else None
@@ -239,7 +275,6 @@ def _format_from_image_candidate(c, idx=1):
         'http_headers': extractor_opts()['http_headers'],
     }
 
-
 def _format_from_video_candidate(c, idx=1):
     url = c.get('url') if isinstance(c, dict) else None
     if not url:
@@ -254,14 +289,11 @@ def _format_from_video_candidate(c, idx=1):
         'fps': c.get('fps'),
         'tbr': c.get('bitrate') or c.get('bandwidth'),
         'ext': 'mp4',
-        # Instagram's video_versions are direct playable video files. Keep them
-        # as a direct source rather than asking yt-dlp to rediscover the post.
         'vcodec': 'h264',
         'acodec': 'aac',
         'filesize': None,
         'http_headers': extractor_opts()['http_headers'],
     }
-
 
 def _public_page_title(html_text):
     for pattern in (
@@ -275,19 +307,11 @@ def _public_page_title(html_text):
             return html.unescape(re.sub(r'\\s+', ' ', m.group(1)).strip())
     return None
 
-
 def _public_page_og_image(html_text):
     m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html_text, re.I)
     return _decode_instagram_escaped(m.group(1)) if m else None
 
-
 def extract_public_instagram_media(url):
-    """Extract public media URLs from Instagram's HTML/embed representation.
-
-    This is a fallback for cases where yt-dlp recognizes the post but returns no
-    video formats, especially image-only posts and carousels. It does not use
-    account cookies or attempt to bypass private access controls.
-    """
     candidates = [url]
     p = urlparse(url)
     path_parts = [x for x in p.path.rstrip('/').split('/') if x]
@@ -309,9 +333,8 @@ def extract_public_instagram_media(url):
 
     for candidate in candidates:
         try:
-            req = Request(candidate, headers=headers)
-            with urlopen(req, timeout=25) as r:
-                html_text = r.read().decode('utf-8', errors='ignore')
+            r = secure_request(candidate, headers=headers, timeout=20)
+            html_text = r.text
             if not html_text or len(html_text) < 200:
                 continue
 
@@ -333,26 +356,21 @@ def extract_public_instagram_media(url):
                     formats = []
                     for n, c in enumerate(video_candidates, 1):
                         f = _format_from_video_candidate(c, n)
-                        if f:
-                            formats.append(f)
+                        if f: formats.append(f)
                     for n, c in enumerate(image_candidates, 1):
                         f = _format_from_image_candidate(c, n)
-                        if f:
-                            formats.append(f)
-                    if not formats:
-                        continue
-                    thumb = (_largest_image_candidate(image_candidates) or {}).get('url')
-                    entries.append({
-                        'title': item.get('accessibility_caption') or title,
-                        'thumbnail': thumb,
-                        'formats': formats,
-                        'duration': item.get('video_duration'),
-                    })
-
+                        if f: formats.append(f)
+                    if formats:
+                        thumb = (_largest_image_candidate(image_candidates) or {}).get('url')
+                        entries.append({
+                            'title': item.get('accessibility_caption') or title,
+                            'thumbnail': thumb,
+                            'formats': formats,
+                            'duration': item.get('video_duration'),
+                        })
                 if entries:
                     return {'title': title, 'webpage_url': url, 'entries': entries, '_public_fallback': True}
 
-            # Single public post/reel fallback. Prefer direct video, then og:image.
             video_lists = []
             for key in ('"video_versions"', 'video_versions'):
                 video_lists.extend(_json_values_after_key(html_text, key))
@@ -365,97 +383,77 @@ def extract_public_instagram_media(url):
                 formats = []
                 for n, c in enumerate(video_candidates, 1):
                     f = _format_from_video_candidate(c, n)
-                    if f:
-                        formats.append(f)
+                    if f: formats.append(f)
                 if formats:
                     thumb = _public_page_og_image(html_text)
                     return {
-                        'title': title,
-                        'webpage_url': url,
-                        'entries': [{'title': title, 'thumbnail': thumb, 'formats': formats}],
-                        '_public_fallback': True,
+                        'title': title, 'webpage_url': url, 'entries': [{'title': title, 'thumbnail': thumb, 'formats': formats}], '_public_fallback': True
                     }
 
             image_url = _public_page_og_image(html_text)
             if image_url:
                 return {
-                    'title': title,
-                    'webpage_url': url,
-                    'entries': [{
-                        'title': title,
-                        'thumbnail': image_url,
-                        'formats': [_format_from_image_candidate({'url': image_url}, 1)],
-                    }],
-                    '_public_fallback': True,
+                    'title': title, 'webpage_url': url,
+                    'entries': [{'title': title, 'thumbnail': image_url, 'formats': [_format_from_image_candidate({'url': image_url}, 1)]}],
+                    '_public_fallback': True
                 }
         except Exception as exc:
             last_error = exc
-            continue
 
     if last_error:
-        raise RuntimeError(f'Public Instagram page fallback failed: {last_error}')
-    raise RuntimeError('Instagram public HTML did not contain an accessible media URL.')
-
+        raise RuntimeError(f'Public HTML fallback failed.')
+    raise RuntimeError('Instagram HTML did not contain accessible media.')
 
 def _gallery_media_url_lines(url, resolve=True):
-    """Get public media URLs from gallery-dl without downloading files."""
-    cmd = [sys.executable, '-m', 'gallery_dl', '-G' if resolve else '-g',
-           '--no-input', '--quiet', url]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45, check=False)
+    cmd = [sys.executable, '-m', 'gallery_dl', '-G' if resolve else '-g', '--no-input', '--quiet', url]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
     urls = []
     for stream in (proc.stdout or '', proc.stderr or ''):
         for line in stream.splitlines():
             line = line.strip()
             if line.startswith(('http://', 'https://')):
-                urls.append(line)
-    seen = set()
-    out = []
+                # Validate URL before exposing it
+                try:
+                    validate_url_safety(line)
+                    urls.append(line)
+                except ValueError:
+                    pass
+    seen, out = set(), []
     for u in urls:
         if u not in seen:
             seen.add(u)
             out.append(u)
     if not out:
-        detail = (proc.stderr or proc.stdout or '').strip()
-        raise RuntimeError(detail[:1200] or f'gallery-dl exited with code {proc.returncode}')
+        raise RuntimeError('gallery-dl failed to resolve usable URLs')
     return out
-
 
 def _gallery_ext(media_url):
     ext = Path(urlparse(media_url).path.lower()).suffix.lstrip('.')
     return ext if ext in {'jpg','jpeg','png','webp','gif','avif','heic','mp4','m4v','mov','webm','m3u8'} else 'bin'
 
-
 def gallery_dl_public_media(url):
-    """Resolve public Instagram photo/carousel media with gallery-dl."""
-    urls = []
-    errors = []
+    urls, errors = [], []
     for resolve in (True, False):
         try:
             urls = _gallery_media_url_lines(url, resolve=resolve)
-            if urls:
-                break
+            if urls: break
         except Exception as exc:
             errors.append(str(exc))
     if not urls:
-        raise RuntimeError('gallery-dl could not resolve public Instagram media: ' + ' | '.join(errors)[-1200:])
+        raise RuntimeError('gallery-dl could not resolve public Instagram media.')
 
     headers = extractor_opts()['http_headers']
     entries = []
     for idx, media_url in enumerate(urls, 1):
         ext = _gallery_ext(media_url)
-        is_video = ext in {'mp4','m4v','mov','webm','m3u8'} or any(
-            token in media_url.lower() for token in ('.mp4', 'video', 'videoplayback')
-        )
+        is_video = ext in {'mp4','m4v','mov','webm','m3u8'} or any(t in media_url.lower() for t in ('.mp4', 'video', 'videoplayback'))
         fmt = {
             'format_id': f'gallery-{idx}',
             'url': media_url,
             'ext': ext if ext != 'bin' else ('mp4' if is_video else 'jpg'),
             'vcodec': 'h264' if is_video else 'none',
             'acodec': 'aac' if is_video else 'none',
-            'width': None,
-            'height': None,
-            'fps': None,
-            'filesize': None,
+            'width': None, 'height': None, 'fps': None, 'filesize': None,
             'http_headers': headers,
         }
         entries.append({
@@ -463,11 +461,21 @@ def gallery_dl_public_media(url):
             'thumbnail': None if is_video else media_url,
             'formats': [fmt],
         })
-    return {'title': 'Instagram media', 'webpage_url': url,
-            'entries': entries, '_gallery_fallback': True}
+    return {'title': 'Instagram media', 'webpage_url': url, 'entries': entries, '_gallery_fallback': True}
+
+def _has_usable_media(info):
+    if not info: return False
+    entries = entries_from(info)
+    if not entries: return False
+    for e in entries:
+        if e.get('formats') or e.get('url'):
+            # Only consider usable if there are formats that have a URL.
+            for f in e.get('formats', []):
+                if f.get('url'): return True
+            if e.get('url'): return True
+    return False
 
 def extract_info(url):
-    """Resolve Instagram media with yt-dlp first and gallery-dl for photo/carousel fallback."""
     key = cache_key(url)
     now = time.time()
     hit = RESOLVE_CACHE.get(key)
@@ -475,150 +483,97 @@ def extract_info(url):
         return hit['info']
 
     errors = []
+    
+    # 1. Primary Strategy: yt-dlp first. Better for videos/Reels.
     candidates = [url]
     candidates.extend(instagram_embed_candidates(url))
-
     for candidate in candidates:
         try:
             info = extract_info_once(candidate)
-            entries = entries_from(info)
-            if not entries:
-                raise RuntimeError('Instagram returned no accessible media.')
-            if not any((e.get('formats') or e.get('url')) for e in entries):
-                raise RuntimeError('Instagram returned an empty media response.')
-            RESOLVE_CACHE[key] = {'created': time.time(), 'info': info}
-            if len(RESOLVE_CACHE) > 20:
-                oldest = min(RESOLVE_CACHE, key=lambda k: RESOLVE_CACHE[k]['created'])
-                RESOLVE_CACHE.pop(oldest, None)
-            return info
+            if _has_usable_media(info):
+                RESOLVE_CACHE[key] = {'created': time.time(), 'info': info}
+                return info
         except Exception as exc:
-            errors.append(str(exc))
-            time.sleep(0.2)
-
+            pass
+            
+    # 2. Secondary Strategy: gallery-dl. Better for multi-image Carousels.
     try:
         fallback = gallery_dl_public_media(url)
-        if entries_from(fallback):
+        if _has_usable_media(fallback):
             RESOLVE_CACHE[key] = {'created': time.time(), 'info': fallback}
             return fallback
     except Exception as exc:
         errors.append(str(exc))
 
+    # 3. Tertiary Strategy: HTML scraping.
     try:
         fallback = extract_public_instagram_media(url)
-        if entries_from(fallback):
+        if _has_usable_media(fallback):
             RESOLVE_CACHE[key] = {'created': time.time(), 'info': fallback}
             return fallback
     except Exception as exc:
         errors.append(str(exc))
 
-    raise RuntimeError((errors[-1] if errors else 'Instagram media could not be resolved.')[:1400])
+    raise RuntimeError('Instagram media could not be resolved from this URL safely.')
 
 def entries_from(info):
     raw = info.get('entries')
     return [e for e in raw if e] if raw else [info]
 
-
 def actual_label(width, height):
-    w = int(width or 0)
-    h = int(height or 0)
-    if not w or not h:
-        return 'Unknown'
-    # Match downloader-style naming by using the larger dimension.
-    long_edge = max(w, h)
-    return f'{long_edge}p'
-
+    w = int(width or 0); h = int(height or 0)
+    if not w or not h: return 'Unknown'
+    return f'{max(w, h)}p'
 
 def bitrate_label(kbps):
-    if not kbps:
-        return 'Bitrate n/a'
-    if kbps >= 1000:
-        return f'{kbps / 1000:.2f} Mbps'
+    if not kbps: return 'Bitrate n/a'
+    if kbps >= 1000: return f'{kbps / 1000:.2f} Mbps'
     return f'{round(kbps):d} kbps'
 
-
 def codec_short(codec):
-    if not codec or codec == 'none':
-        return None
+    if not codec or codec == 'none': return None
     return codec.split('.', 1)[0]
 
-
 def video_variants(formats):
-    variants = []
-    seen = set()
+    variants = []; seen = set()
     for f in formats:
-        if not f.get('url') or f.get('vcodec') in (None, 'none'):
-            continue
-        w = int(f.get('width') or 0)
-        h = int(f.get('height') or 0)
-        if not w or not h:
-            continue
-        tbr = float(f.get('tbr') or 0)
-        fps = float(f.get('fps') or 0)
+        if not f.get('url') or f.get('vcodec') in (None, 'none'): continue
+        w = int(f.get('width') or 0); h = int(f.get('height') or 0)
+        if not w or not h: continue
+        tbr = float(f.get('tbr') or 0); fps = float(f.get('fps') or 0)
         size = int(filesize(f) or 0)
-        key = (
-            w, h, round(tbr, 2), round(fps, 2), codec_short(f.get('vcodec')),
-            codec_short(f.get('acodec')), f.get('ext'), f.get('protocol'),
-        )
-        # Keep distinct bitrate/resolution/codec representations, while removing exact duplicates.
-        if key in seen:
-            continue
+        key = (w, h, round(tbr, 2), round(fps, 2), codec_short(f.get('vcodec')), codec_short(f.get('acodec')), f.get('ext'), f.get('protocol'))
+        if key in seen: continue
         seen.add(key)
         variants.append({
             'format_id': str(f.get('format_id') or ''),
-            'label': actual_label(w, h),
-            'width': w,
-            'height': h,
-            'resolution': f'{w} × {h}',
-            'long_edge': max(w, h),
-            'short_edge': min(w, h),
-            'fps': fps or None,
-            'tbr': tbr or None,
-            'bitrate_label': bitrate_label(tbr),
-            'filesize': size or None,
-            'filesize_label': fmt_bytes(size),
-            'ext': f.get('ext') or 'media',
-            'vcodec': codec_short(f.get('vcodec')),
-            'acodec': codec_short(f.get('acodec')),
-            'has_audio': f.get('acodec') not in (None, 'none'),
-            'format_note': f.get('format_note'),
-            'protocol': f.get('protocol'),
+            'label': actual_label(w, h), 'width': w, 'height': h, 'resolution': f'{w} × {h}',
+            'long_edge': max(w, h), 'short_edge': min(w, h),
+            'fps': fps or None, 'tbr': tbr or None, 'bitrate_label': bitrate_label(tbr),
+            'filesize': size or None, 'filesize_label': fmt_bytes(size),
+            'ext': f.get('ext') or 'media', 'vcodec': codec_short(f.get('vcodec')),
+            'acodec': codec_short(f.get('acodec')), 'has_audio': f.get('acodec') not in (None, 'none'),
+            'format_note': f.get('format_note'), 'protocol': f.get('protocol'),
         })
-    variants.sort(key=lambda v: (
-        v['long_edge'], v['short_edge'], float(v['tbr'] or 0),
-        float(v['fps'] or 0), int(v['filesize'] or 0)
-    ), reverse=True)
+    variants.sort(key=lambda v: (v['long_edge'], v['short_edge'], float(v['tbr'] or 0), float(v['fps'] or 0), int(v['filesize'] or 0)), reverse=True)
     return variants
-
 
 def image_variants(formats):
     variants = []
     for f in formats:
-        if not f.get('url') or f.get('vcodec') not in (None, 'none'):
-            continue
-        w = int(f.get('width') or 0)
-        h = int(f.get('height') or 0)
+        if not f.get('url') or f.get('vcodec') not in (None, 'none'): continue
+        w = int(f.get('width') or 0); h = int(f.get('height') or 0)
         variants.append({
             'format_id': str(f.get('format_id') or ''),
             'label': 'Original image' if not (w and h) else f'{w} × {h}',
-            'width': w or None,
-            'height': h or None,
-            'resolution': f'{w} × {h}' if w and h else None,
-            'long_edge': max(w, h) if w and h else 0,
-            'short_edge': min(w, h) if w and h else 0,
-            'fps': None,
-            'tbr': None,
-            'bitrate_label': 'Image',
-            'filesize': int(filesize(f) or 0) or None,
-            'filesize_label': fmt_bytes(filesize(f)),
-            'ext': f.get('ext') or 'jpg',
-            'vcodec': None,
-            'acodec': None,
-            'has_audio': False,
-            'format_note': f.get('format_note'),
-            'protocol': f.get('protocol'),
+            'width': w or None, 'height': h or None, 'resolution': f'{w} × {h}' if w and h else None,
+            'long_edge': max(w, h) if w and h else 0, 'short_edge': min(w, h) if w and h else 0,
+            'fps': None, 'tbr': None, 'bitrate_label': 'Image',
+            'filesize': int(filesize(f) or 0) or None, 'filesize_label': fmt_bytes(filesize(f)),
+            'ext': f.get('ext') or 'jpg', 'vcodec': None, 'acodec': None, 'has_audio': False,
+            'format_note': f.get('format_note'), 'protocol': f.get('protocol'),
         })
     return variants
-
 
 def best_format(formats):
     usable = [f for f in formats if f.get('url')]
@@ -630,19 +585,12 @@ def best_format(formats):
     best_progressive = max(progressive, key=format_score, default=None)
     return best_video, best_audio, best_progressive
 
-
-def best_variant_obj(variants):
-    return variants[0] if variants else None
-
-
 def choose_format_by_id(formats, format_id):
-    if not format_id:
-        return None
+    if not format_id: return None
     for f in formats:
         if str(f.get('format_id')) == str(format_id) and f.get('url'):
             return f
     return None
-
 
 def media_row(idx, item, fallback_title):
     formats = item.get('formats') or []
@@ -658,34 +606,21 @@ def media_row(idx, item, fallback_title):
             thumb = max(thumbs, key=lambda t: ((t.get('height') or 0) * (t.get('width') or 0))).get('url')
     is_video = bool(best_video or item.get('duration') or any(v.get('vcodec') for v in variants))
     return {
-        'index': idx,
-        'type': 'video' if is_video else 'image',
+        'index': idx, 'type': 'video' if is_video else 'image',
         'title': item.get('title') or fallback_title or f'Instagram media {idx}',
-        'thumbnail': thumb,
-        'width': (chosen or {}).get('width'),
-        'height': (chosen or {}).get('height'),
-        'fps': (chosen or {}).get('fps'),
-        'duration': item.get('duration'),
-        'formats_count': len(formats),
-        'variant_count': len(variants),
-        'filesize': filesize(chosen or {}),
-        'tbr': (chosen or {}).get('tbr'),
-        'abr': (best_audio or {}).get('abr'),
-        'vcodec': (chosen or {}).get('vcodec'),
-        'acodec': (chosen or {}).get('acodec'),
-        'ext': (chosen or {}).get('ext') or item.get('ext'),
-        'format_note': (chosen or {}).get('format_note'),
-        'best_video_id': (best_video or {}).get('format_id'),
-        'best_audio_id': (best_audio or {}).get('format_id'),
-        'best_progressive_id': (best_progressive or {}).get('format_id'),
-        'variants': variants,
+        'thumbnail': thumb, 'width': (chosen or {}).get('width'), 'height': (chosen or {}).get('height'),
+        'fps': (chosen or {}).get('fps'), 'duration': item.get('duration'),
+        'formats_count': len(formats), 'variant_count': len(variants),
+        'filesize': filesize(chosen or {}), 'tbr': (chosen or {}).get('tbr'), 'abr': (best_audio or {}).get('abr'),
+        'vcodec': (chosen or {}).get('vcodec'), 'acodec': (chosen or {}).get('acodec'),
+        'ext': (chosen or {}).get('ext') or item.get('ext'), 'format_note': (chosen or {}).get('format_note'),
+        'best_video_id': (best_video or {}).get('format_id'), 'best_audio_id': (best_audio or {}).get('format_id'),
+        'best_progressive_id': (best_progressive or {}).get('format_id'), 'variants': variants,
     }
-
 
 @app.get('/')
 def index():
     return app.send_static_file('index.html')
-
 
 PAGE_MAP = {
     '/instagram-video-downloader': 'instagram-video-downloader.html',
@@ -693,15 +628,12 @@ PAGE_MAP = {
     '/instagram-photo-downloader': 'instagram-photo-downloader.html',
     '/instagram-story-downloader': 'instagram-story-downloader.html',
     '/instagram-carousel-downloader': 'instagram-carousel-downloader.html',
-    '/about': 'about.html',
-    '/privacy': 'privacy.html',
-    '/terms': 'terms.html',
-    '/copyright': 'copyright.html',
-    '/contact': 'contact.html',
+    '/about': 'about.html', '/privacy': 'privacy.html', '/terms': 'terms.html',
+    '/copyright': 'copyright.html', '/contact': 'contact.html',
 }
 
 for _path, _filename in PAGE_MAP.items():
-    app.add_url_rule(_path, endpoint='page_' + _filename.replace('.', '_'), view_func=lambda _filename=_filename: app.send_static_file(_filename))
+    app.add_url_rule(_path, endpoint='page_' + _filename.replace('.', '_'), view_func=lambda _f=_filename: app.send_static_file(_f))
 
 @app.get('/robots.txt')
 def robots():
@@ -720,7 +652,6 @@ def sitemap():
 def health():
     return jsonify({'ok': True})
 
-
 @app.post('/api/resolve')
 def resolve():
     data = request.get_json(silent=True) or {}
@@ -734,47 +665,26 @@ def resolve():
         max_dimension = max((max(m.get('width') or 0, m.get('height') or 0) for m in media), default=0)
         total_variants = sum(m.get('variant_count', 0) for m in media)
         return jsonify({
-            'ok': True,
-            'media_count': len(media),
-            'media': media,
-            'title': info.get('title') or 'Instagram media',
-            'webpage_url': info.get('webpage_url') or url,
-            'max_dimension': max_dimension,
-            'total_variants': total_variants,
-            'note': 'Every distinct video representation exposed by the extractor is shown. Selecting a source downloads that exact video representation and, when needed, muxes the best accessible audio without re-encoding the video.',
+            'ok': True, 'media_count': len(media), 'media': media,
+            'title': info.get('title') or 'Instagram media', 'webpage_url': info.get('webpage_url') or url,
+            'max_dimension': max_dimension, 'total_variants': total_variants,
+            'note': 'Media distinct representation exposed by the extractor is shown.',
         })
     except Exception as exc:
-        message = str(exc)[:1400]
-        if 'empty media response' in message.lower():
-            message = ('Instagram did not expose media to the anonymous extractor for this URL. '
-                       'The same public post may still work later or through a different Instagram representation.')
+        message = "Extraction failed. The post might be private, login-required, or temporarily unavailable."
         return jsonify({'error': message}), 502
 
-
-def header_blob(headers):
-    if not headers:
-        return ''
-    lines = []
-    for k, v in headers.items():
-        if k.lower() in {'host', 'content-length'}:
-            continue
-        lines.append(f'{k}: {v}')
-    return '\r\n'.join(lines) + ('\r\n' if lines else '')
-
-
 def http_stream(url, headers=None, chunk_size=256 * 1024):
-    req = Request(url, headers=headers or {})
-    with urlopen(req, timeout=60) as r:
-        while True:
-            chunk = r.read(chunk_size)
-            if not chunk:
-                return
-            yield chunk
-
+    try:
+        resp = secure_request(url, headers=headers, stream=True, timeout=30)
+        resp.raise_for_status()
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if chunk: yield chunk
+    except Exception as e:
+        raise RuntimeError("Proxy backend stream failed")
 
 def cd(filename):
     return 'attachment; filename="' + filename.replace('"', '') + '"'
-
 
 def selected_media(info, index, format_id=None):
     entries = entries_from(info)
@@ -784,9 +694,14 @@ def selected_media(info, index, format_id=None):
     if chosen is None:
         best_video, _, best_progressive = best_format(formats)
         chosen = best_progressive or best_video
+        if not chosen and formats:
+            # Fallback to image formats
+            images = image_variants(formats)
+            if images:
+                chosen = choose_format_by_id(formats, images[0]['format_id'])
+
     best_audio = best_format(formats)[1]
     return item, chosen, best_audio
-
 
 @app.get('/api/download')
 def download():
@@ -795,7 +710,6 @@ def download():
         media_index = max(1, int(request.args.get('index', '1')))
     except ValueError:
         media_index = 1
-
     format_id = request.args.get('format_id', '').strip() or None
 
     if not valid_instagram_url(url):
@@ -803,7 +717,6 @@ def download():
 
     temp_dir = None
     try:
-        # Re-resolve immediately before download so CDN URLs and their headers are fresh.
         info = extract_info(url)
         item, chosen, best_audio = selected_media(info, media_index, format_id)
 
@@ -811,8 +724,8 @@ def download():
             return jsonify({'error': 'The selected source variant is no longer available. Analyze the URL again and retry.'}), 502
 
         title = safe_name(item.get('title') or info.get('title') or f'instagram-media-{media_index}')
-
-        # If the selected representation already contains audio, stream that exact URL.
+        
+        # If it's an image or progressive audio/video, stream directly. No ffmpeg shell needed.
         if chosen.get('acodec') not in (None, 'none') or chosen.get('vcodec') in (None, 'none'):
             ext = (chosen.get('ext') or ('jpg' if chosen.get('vcodec') in (None, 'none') else 'mp4')).lower()
             filename = title + '.' + ext
@@ -826,9 +739,6 @@ def download():
                 headers['Content-Length'] = str(chosen['filesize'])
             return Response(http_stream(chosen['url'], chosen.get('http_headers')), headers=headers, direct_passthrough=True)
 
-        # Video-only formats are downloaded with yt-dlp itself. This is more reliable
-        # than handing Instagram CDN URLs directly to ffmpeg because yt-dlp preserves
-        # the extractor's per-format HTTP headers and CDN access parameters.
         if chosen.get('vcodec') not in (None, 'none'):
             ffmpeg = get_ffmpeg_path()
             if not ffmpeg:
@@ -836,47 +746,29 @@ def download():
 
             temp_dir = tempfile.mkdtemp(prefix='instamax-')
             outtmpl = os.path.join(temp_dir, 'media.%(ext)s')
-
-            # First attempt: exact selected video representation + best accessible audio.
-            # yt-dlp/ffmpeg will remux without re-encoding when the streams are compatible.
-            format_expr = f'{format_id}+bestaudio' if format_id else 'bestvideo+bestaudio/best'
+            
+            # Using yt-dlp arguments list. 
+            # Note: No arbitrary string formatting that executes shell code.
             opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'noplaylist': True,
-                'format': format_expr,
-                'outtmpl': outtmpl,
-                'merge_output_format': 'mp4',
-                'ffmpeg_location': ffmpeg,
-                'overwrites': True,
+                'quiet': True, 'no_warnings': True, 'noplaylist': True,
+                'format': f'{format_id}+bestaudio' if format_id else 'bestvideo+bestaudio/best',
+                'outtmpl': outtmpl, 'merge_output_format': 'mp4',
+                'ffmpeg_location': ffmpeg, 'overwrites': True,
             }
 
             downloaded_path = None
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([url])
-                files = [
-                    os.path.join(temp_dir, name)
-                    for name in os.listdir(temp_dir)
-                    if os.path.isfile(os.path.join(temp_dir, name))
-                    and not name.endswith(('.part', '.ytdl'))
-                ]
-                if files:
-                    downloaded_path = max(files, key=os.path.getsize)
+                files = [os.path.join(temp_dir, name) for name in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, name)) and not name.endswith(('.part', '.ytdl'))]
+                if files: downloaded_path = max(files, key=os.path.getsize)
             except Exception:
-                # If combining audio fails, fall back to the exact selected video stream.
                 opts['format'] = str(format_id) if format_id else 'bestvideo'
                 opts.pop('merge_output_format', None)
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.download([url])
-                files = [
-                    os.path.join(temp_dir, name)
-                    for name in os.listdir(temp_dir)
-                    if os.path.isfile(os.path.join(temp_dir, name))
-                    and not name.endswith(('.part', '.ytdl'))
-                ]
-                if files:
-                    downloaded_path = max(files, key=os.path.getsize)
+                files = [os.path.join(temp_dir, name) for name in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, name)) and not name.endswith(('.part', '.ytdl'))]
+                if files: downloaded_path = max(files, key=os.path.getsize)
 
             if not downloaded_path:
                 raise RuntimeError('The selected media could not be downloaded from Instagram.')
@@ -885,49 +777,28 @@ def download():
             filename = title + ('.mp4' if ext in ('.mp4', '.m4v', '.mov') else ext)
             mime = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
-            response = send_file(
-                downloaded_path,
-                mimetype=mime,
-                as_attachment=True,
-                download_name=filename,
-                conditional=True,
-                max_age=0,
-            )
-
+            response = send_file(downloaded_path, mimetype=mime, as_attachment=True, download_name=filename, conditional=True, max_age=0)
             def cleanup():
                 try:
                     for name in os.listdir(temp_dir):
-                        try:
-                            os.remove(os.path.join(temp_dir, name))
-                        except OSError:
-                            pass
+                        try: os.remove(os.path.join(temp_dir, name))
+                        except: pass
                     os.rmdir(temp_dir)
-                except OSError:
+                except:
                     pass
-
             response.call_on_close(cleanup)
             return response
 
-        return jsonify({'error': 'The selected source variant cannot be downloaded from the exposed formats.'}), 502
+        return jsonify({'error': 'Variant could not be downloaded.'}), 502
 
     except Exception as exc:
         if temp_dir:
             try:
-                for name in os.listdir(temp_dir):
-                    try:
-                        os.remove(os.path.join(temp_dir, name))
-                    except OSError:
-                        pass
-                os.rmdir(temp_dir)
-            except OSError:
-                pass
-        message = str(exc)[:1200]
-        if 'empty media response' in message.lower():
-            message = ('Instagram did not expose this media to the anonymous extractor. '
-                       'Try analyzing again or use another publicly accessible post.')
-        return jsonify({'error': 'Download failed: ' + message}), 502
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except: pass
+        return jsonify({'error': 'Download failed. The media may be private.'}), 502
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '8787'))
-    host = os.environ.get('HOST', '127.0.0.1')
+    host = os.environ.get('HOST', '0.0.0.0')
     app.run(host=host, port=port, debug=False, threaded=True)
