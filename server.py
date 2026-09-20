@@ -10,6 +10,7 @@ import json
 import socket
 import ipaddress
 import sys
+import logging
 from urllib.parse import urlparse, urljoin
 from pathlib import Path
 
@@ -24,6 +25,8 @@ except ImportError:
 
 # Protect against common DOS
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
@@ -179,6 +182,117 @@ def instagram_embed_candidates(url: str):
     base = f'https://www.instagram.com/{kind}/{shortcode}/embed/'
     legacy = f'https://www.instagram.com/{kind}/{shortcode}/embed/captioned/'
     return [base, legacy]
+
+class ExtractionFailure(RuntimeError):
+    """Sanitized, user-facing extraction failure with the original exception retained server-side."""
+
+    def __init__(self, category, message, cause=None):
+        super().__init__(message)
+        self.category = category
+        self.message = message
+        self.cause = cause
+
+
+def _exception_status_code(exc):
+    """Best-effort status extraction without exposing exception internals to clients."""
+    seen = set()
+    current = exc
+    for _ in range(6):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        for attr in ('status', 'status_code', 'code'):
+            value = getattr(current, attr, None)
+            if isinstance(value, int) and 100 <= value <= 599:
+                return value
+        text_value = str(current)
+        match = re.search(r'\bHTTP(?: Error)?[\s:]+(\d{3})\b', text_value, re.I)
+        if not match:
+            match = re.search(r'\b(?:status|status code)[\s:=]+(\d{3})\b', text_value, re.I)
+        if match:
+            return int(match.group(1))
+        current = getattr(current, '__cause__', None) or getattr(current, '__context__', None)
+    return None
+
+
+def _sanitize_extractor_error(exc):
+    """Return a short, safe single-line extractor message for the browser."""
+    raw = str(exc or '').strip()
+    if not raw:
+        return 'The extractor returned an unspecified error.'
+    if 'Traceback (most recent call last)' in raw:
+        raw = raw.split('Traceback (most recent call last)', 1)[0].strip()
+    raw = raw.splitlines()[0].strip()
+    raw = re.sub(r'(?i)(?:cookie|authorization|proxy-authorization|set-cookie|x-api-key)\s*[:=]\s*[^;\n]+', '[redacted]', raw)
+    raw = re.sub(r'(?i)(?:[A-Za-z]:\\|(?:/tmp|/var|/home|/workspace|/mnt)(?:/|\\))[^\s]+', '[redacted-path]', raw)
+    raw = re.sub(r'(?i)(?:127\.0\.0\.1|0\.0\.0\.0|localhost)(?::\d+)?', '[redacted-host]', raw)
+    raw = raw.replace('\x00', '')
+    raw = re.sub(r'\s+', ' ', raw)
+    return raw[:320] or 'The extractor returned an unspecified error.'
+
+
+def classify_extractor_error(exc):
+    """Map extractor failures to stable, user-safe categories."""
+    text = str(exc or '').strip()
+    lower = text.lower()
+    status = _exception_status_code(exc)
+
+    # Explicit upstream HTTP status always wins over message-text heuristics.
+    if status == 429 or re.search(r'\b429\b|too many requests|rate[- ]limit', lower):
+        return {
+            'category': 'rate_limited',
+            'message': 'Instagram is rate-limiting requests right now. Please retry later.',
+            'use_media_fallback': False,
+        }
+
+    if status == 403 or re.search(r'\b403\b|forbidden|access denied', lower):
+        return {
+            'category': 'access_denied',
+            'message': 'Instagram denied access to this media.',
+            'use_media_fallback': False,
+        }
+
+    if status == 404 or re.search(r'\b404\b|not found|does not exist', lower):
+        return {
+            'category': 'not_found',
+            'message': 'Instagram could not find this media.',
+            'use_media_fallback': False,
+        }
+
+    if re.search(r'no video formats found|there is no video in this post', lower):
+        return {
+            'category': 'image_or_carousel_fallback',
+            'message': 'No video formats were found. This post may be an image or carousel.',
+            'use_media_fallback': True,
+        }
+
+    if 'instagram sent an empty media response' in lower:
+        return {
+            'category': 'extractor_unavailable',
+            'message': 'Instagram did not expose this media to the extractor.',
+            'use_media_fallback': True,
+        }
+
+    if re.search(r'login required|login is required|log in to view|login to view|please log in|sign in to continue|authentication required', lower):
+        return {
+            'category': 'login_required',
+            'message': 'Instagram requires login to access this media.',
+            'use_media_fallback': False,
+        }
+
+    if re.search(r'private account|account is private|post is private|content is private|media is private', lower):
+        return {
+            'category': 'private',
+            'message': 'This Instagram content is private.',
+            'use_media_fallback': False,
+        }
+
+    return {
+        'category': 'extractor_error',
+        'message': _sanitize_extractor_error(exc),
+        'use_media_fallback': True,
+    }
+
 
 def extract_info_once(url):
     with yt_dlp.YoutubeDL(extractor_opts()) as ydl:
@@ -482,8 +596,9 @@ def extract_info(url):
     if hit and now - hit['created'] < CACHE_TTL:
         return hit['info']
 
-    errors = []
-    
+    primary_failures = []
+    fallback_failures = []
+
     # 1. Primary Strategy: yt-dlp first. Better for videos/Reels.
     candidates = [url]
     candidates.extend(instagram_embed_candidates(url))
@@ -494,16 +609,20 @@ def extract_info(url):
                 RESOLVE_CACHE[key] = {'created': time.time(), 'info': info}
                 return info
         except Exception as exc:
-            pass
-            
-    # 2. Secondary Strategy: gallery-dl. Better for multi-image Carousels.
+            classification = classify_extractor_error(exc)
+            primary_failures.append((classification, exc, candidate))
+            logger.exception('yt-dlp extraction failed for candidate %s', candidate)
+
+    # 2. Secondary Strategy: gallery-dl. Better for image/photo/carousel media.
+    # No-video and empty-media extractor failures explicitly flow through this fallback.
     try:
         fallback = gallery_dl_public_media(url)
         if _has_usable_media(fallback):
             RESOLVE_CACHE[key] = {'created': time.time(), 'info': fallback}
             return fallback
     except Exception as exc:
-        errors.append(str(exc))
+        fallback_failures.append((classify_extractor_error(exc), exc, url))
+        logger.exception('gallery-dl fallback failed for %s', url)
 
     # 3. Tertiary Strategy: HTML scraping.
     try:
@@ -512,9 +631,23 @@ def extract_info(url):
             RESOLVE_CACHE[key] = {'created': time.time(), 'info': fallback}
             return fallback
     except Exception as exc:
-        errors.append(str(exc))
+        fallback_failures.append((classify_extractor_error(exc), exc, url))
+        logger.exception('HTML Instagram fallback failed for %s', url)
 
-    raise RuntimeError('Instagram media could not be resolved from this URL safely.')
+    failures = primary_failures or fallback_failures
+    if failures:
+        # Prefer the original yt-dlp failure over downstream fallback errors.
+        classification, cause, candidate = failures[0]
+        raise ExtractionFailure(
+            classification['category'],
+            classification['message'],
+            cause=cause,
+        ) from cause
+
+    raise ExtractionFailure(
+        'extractor_error',
+        'The extractor could not resolve this Instagram media.',
+    )
 
 def entries_from(info):
     raw = info.get('entries')
@@ -670,9 +803,19 @@ def resolve():
             'max_dimension': max_dimension, 'total_variants': total_variants,
             'note': 'Media distinct representation exposed by the extractor is shown.',
         })
+    except ExtractionFailure as exc:
+        logger.exception('Resolve extraction failed for %s', url)
+        return jsonify({
+            'error': exc.message,
+            'error_category': exc.category,
+        }), 502
     except Exception as exc:
-        message = "Extraction failed. The post might be private, login-required, or temporarily unavailable."
-        return jsonify({'error': message}), 502
+        logger.exception('Unexpected resolve failure for %s', url)
+        classification = classify_extractor_error(exc)
+        return jsonify({
+            'error': classification['message'],
+            'error_category': classification['category'],
+        }), 502
 
 def http_stream(url, headers=None, chunk_size=256 * 1024):
     try:
