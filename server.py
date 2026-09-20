@@ -942,6 +942,6 @@ def download():
         return jsonify({'error': 'Download failed. The media may be private.'}), 502
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', '8787'))
+    port = int(os.environ.get('PORT', '8787')) 
     host = os.environ.get('HOST', '0.0.0.0')
     app.run(host=host, port=port, debug=False, threaded=True)
