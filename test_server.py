@@ -77,6 +77,100 @@ def _image_fallback():
     }
 
 
+def test_no_video_formats_routes_to_instaloader_carousel_fallback(monkeypatch):
+    server.RESOLVE_CACHE.clear()
+
+    monkeypatch.setattr(
+        server,
+        'extract_info_once',
+        lambda _url: (_ for _ in ()).throw(DownloadError('No video formats found')),
+    )
+
+    fallback = {
+        'title': 'Carousel',
+        'webpage_url': 'https://www.instagram.com/p/carousel123/',
+        '_instaloader_fallback': True,
+        'entries': [
+            {
+                'title': 'Carousel',
+                'thumbnail': 'https://cdn.example.test/1.jpg',
+                'formats': [{
+                    'format_id': 'img-instaloader-1',
+                    'url': 'https://cdn.example.test/1.jpg',
+                    'width': 1080,
+                    'height': 1080,
+                    'ext': 'jpg',
+                    'vcodec': 'none',
+                    'acodec': 'none',
+                }],
+            },
+            {
+                'title': 'Carousel',
+                'thumbnail': 'https://cdn.example.test/2.jpg',
+                'formats': [{
+                    'format_id': 'img-instaloader-2',
+                    'url': 'https://cdn.example.test/2.jpg',
+                    'width': 1080,
+                    'height': 1350,
+                    'ext': 'jpg',
+                    'vcodec': 'none',
+                    'acodec': 'none',
+                }],
+            },
+        ],
+    }
+
+    monkeypatch.setattr(server, 'instaloader_public_media', lambda _url: fallback)
+    monkeypatch.setattr(
+        server,
+        'gallery_dl_public_media',
+        lambda _url: pytest.fail('gallery-dl should not be reached when Instaloader succeeds'),
+    )
+    monkeypatch.setattr(
+        server,
+        'extract_public_instagram_media',
+        lambda _url: pytest.fail('HTML fallback should not be reached when Instaloader succeeds'),
+    )
+
+    info = server.extract_info('https://www.instagram.com/p/carousel123/')
+
+    assert info['_instaloader_fallback'] is True
+    assert len(info['entries']) == 2
+    assert all(e['formats'][0]['vcodec'] == 'none' for e in info['entries'])
+
+
+def test_fallback_failure_is_not_hidden_by_no_video_error(monkeypatch):
+    server.RESOLVE_CACHE.clear()
+
+    monkeypatch.setattr(
+        server,
+        'extract_info_once',
+        lambda _url: (_ for _ in ()).throw(DownloadError('No video formats found')),
+    )
+    monkeypatch.setattr(
+        server,
+        'instaloader_public_media',
+        lambda _url: (_ for _ in ()).throw(RuntimeError('Instaloader fallback is not installed.')),
+    )
+    monkeypatch.setattr(
+        server,
+        'gallery_dl_public_media',
+        lambda _url: (_ for _ in ()).throw(RuntimeError('gallery-dl failed to resolve usable URLs')),
+    )
+    monkeypatch.setattr(
+        server,
+        'extract_public_instagram_media',
+        lambda _url: (_ for _ in ()).throw(RuntimeError('Instagram HTML did not contain accessible media.')),
+    )
+
+    with pytest.raises(server.ExtractionFailure) as caught:
+        server.extract_info('https://www.instagram.com/p/fallbackfail123/')
+
+    assert caught.value.category == 'extractor_error'
+    assert 'No video formats found' not in caught.value.message
+    assert 'HTML did not contain accessible media' in caught.value.message
+
+
 def test_no_video_formats_routes_to_image_fallback(monkeypatch):
     server.RESOLVE_CACHE.clear()
 
